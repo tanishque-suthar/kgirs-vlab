@@ -1,5 +1,17 @@
 # Advanced Cypher Queries and Graph Pattern Matching: Virtual Laboratory
 
+## Team Members
+
+| Name | Roll No. |
+| :--- | :---: |
+| Tanishque Suthar | 53 |
+| Nihal Sinha | 51 |
+| Vanshika Somnani | 52 |
+| Harsh Tanwani | 54 |
+| Sakshi Thorat | 55 |
+
+---
+
 An interactive, educational Streamlit virtual laboratory experiment for learning and evaluating **Advanced Cypher Queries, Multi-Hop Traversal, and Graph Pattern Matching** on an **Academic Citation & Co-authorship Knowledge Graph**.
 
 ---
