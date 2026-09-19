@@ -526,10 +526,18 @@ def execute_custom_cypher_pattern(G: nx.DiGraph, query_text: str):
     matched_edges = set()
     results = []
 
-    # Case 1: Node matching with WHERE and RETURN
-    m_node = re.search(r'MATCH\s+\((\w+):(\w+)\)(?:\s+WHERE\s+(.+?))?(?:\s+RETURN\s+(.+))?$', q, re.IGNORECASE)
+    # Case 1: Node matching with WHERE, RETURN, ORDER BY, LIMIT
+    m_node = re.search(
+        r'MATCH\s+\((\w+):(\w+)\)'
+        r'(?:\s+WHERE\s+(.+?))?'
+        r'(?:\s+RETURN\s+(.+?))?'
+        r'(?:\s+ORDER\s+BY\s+(.+?))?'
+        r'(?:\s+LIMIT\s+(\d+))?$',
+        q,
+        re.IGNORECASE | re.DOTALL
+    )
     if m_node and '-[' not in q:
-        var, label, where_clause, return_clause = m_node.groups()
+        var, label, where_clause, return_clause, order_clause, limit_s = m_node.groups()
         for node_id, data in G.nodes(data=True):
             if data.get("label", "").lower() == label.lower():
                 keep = True
@@ -563,20 +571,64 @@ def execute_custom_cypher_pattern(G: nx.DiGraph, query_text: str):
                             row[k.replace("_", " ").title()] = data[k]
                     results.append(row)
 
+        df_res = pd.DataFrame(results)
+        if not df_res.empty and order_clause:
+            for ot in order_clause.split(','):
+                parts = ot.strip().split()
+                if parts:
+                    col = parts[0]
+                    asc = True if len(parts) < 2 or parts[1].upper() == 'ASC' else False
+                    match_cols = [c for c in df_res.columns if c.lower() == col.lower()]
+                    if match_cols:
+                        df_res = df_res.sort_values(by=match_cols[0], ascending=asc)
+        if limit_s and not df_res.empty:
+            df_res = df_res.head(int(limit_s))
+
     # Case 2: 1-hop or multi-hop path matching
     else:
         rel_m = re.search(
-            r'MATCH\s+(?:path\s*=\s*)?\((\w+)(?::(\w+))?(?:\s*\{.*?id:\s*[\'"]?(\w+)[\'"]?\})?\)'
-            r'-\[:(\w+)(?:\*(\d+)?(?:\.\.(\d+))?)?\]-(>)?'
-            r'\((\w+)(?::(\w+))?(?:\s*\{.*?id:\s*[\'"]?(\w+)[\'"]?\})?\)'
-            r'(?:\s+WHERE\s+(.+?))?(?:\s+RETURN.+)?$',
-            q, re.IGNORECASE
+            r'MATCH\s+(?:(?P<path_var>\w+)\s*=\s*)?'
+            r'\((?P<src_var>\w+)(?::(?P<src_lbl>\w+))?(?:\s*\{.*?id:\s*[\'"]?(?P<src_id>\w+)[\'"]?\})?\)'
+            r'-\[:(?P<rel_type>\w+)(?:\*(?P<min_h>\d+)?(?:\.\.(?P<max_h>\d+))?)?\]-(?P<is_dir>>)?'
+            r'\((?P<dst_var>\w+)(?::(?P<dst_lbl>\w+))?(?:\s*\{.*?id:\s*[\'"]?(?P<dst_id>\w+)[\'"]?\})?\)'
+            r'(?:\s+WHERE\s+(?P<where_clause>.+?))?'
+            r'(?:\s+RETURN\s+(?P<return_clause>.+?))?'
+            r'(?:\s+ORDER\s+BY\s+(?P<order_clause>.+?))?'
+            r'(?:\s+LIMIT\s+(?P<limit>\d+))?$',
+            q,
+            re.IGNORECASE | re.DOTALL
         )
         if rel_m:
-            src_var, src_lbl, src_id, rel_type, min_h, max_h, is_dir, dst_var, dst_lbl, dst_id, where_clause = rel_m.groups()
-            min_hops = int(min_h) if min_h else 1
-            max_hops = int(max_h) if max_h else (min_hops if min_h else 1)
-            directed = bool(is_dir)
+            gd = rel_m.groupdict()
+            min_hops = int(gd["min_h"]) if gd["min_h"] else 1
+            max_hops = int(gd["max_h"]) if gd["max_h"] else (min_hops if gd["min_h"] else 1)
+            directed = bool(gd["is_dir"])
+            src_var = gd["src_var"]
+            src_lbl = gd["src_lbl"]
+            src_id = gd["src_id"]
+            dst_var = gd["dst_var"]
+            dst_lbl = gd["dst_lbl"]
+            dst_id = gd["dst_id"]
+            rel_type = gd["rel_type"]
+            where_clause = gd["where_clause"]
+            return_clause = gd["return_clause"]
+            order_clause = gd["order_clause"]
+            limit_s = gd["limit"]
+
+            # Parse list predicates like: ALL(p IN nodes(path)[1..3] WHERE p.citations >= 400)
+            all_predicates = []
+            clean_where = where_clause or ""
+            if where_clause:
+                all_matches = re.finditer(
+                    r'ALL\s*\(\s*(?P<item>\w+)\s+IN\s+nodes\s*\(\s*(?P<path>\w+)\s*\)(?:\[(?P<start>\d+)?\.\.(?P<end>\d+)?\])?\s+WHERE\s+(?P<cond>.+?)\s*\)',
+                    where_clause, re.IGNORECASE
+                )
+                for am in all_matches:
+                    s_idx = int(am.group('start')) if am.group('start') else 0
+                    e_idx = int(am.group('end')) if am.group('end') else None
+                    cond_str = am.group('cond').strip()
+                    all_predicates.append((s_idx, e_idx, cond_str))
+                    clean_where = clean_where.replace(am.group(0), ' ')
 
             search_nodes = [src_id] if src_id else [
                 n for n, d in G.nodes(data=True) if not src_lbl or d.get("label", "").lower() == src_lbl.lower()
@@ -596,10 +648,30 @@ def execute_custom_cypher_pattern(G: nx.DiGraph, query_text: str):
 
                         if label_ok and id_ok and not_trivial_loop:
                             keep = True
-                            if where_clause:
+
+                            # Evaluate ALL(...) predicates across path nodes
+                            for s_idx, e_idx, cond_str in all_predicates:
+                                sub_nodes = curr_path[s_idx:e_idx] if e_idx is not None else curr_path[s_idx:]
+                                for n in sub_nodes:
+                                    n_data = G.nodes[n]
+                                    for prop in ["year", "citations", "h_index"]:
+                                        if prop in cond_str:
+                                            c_m = re.search(rf'{prop}\s*(=|>=|<=|>|<|!=|<>)\s*([0-9.]+)', cond_str)
+                                            if c_m:
+                                                op, val_s = c_m.groups()
+                                                val = n_data.get(prop, 0)
+                                                target_num = float(val_s)
+                                                if op == '>=' and not (val >= target_num): keep = False
+                                                elif op == '<=' and not (val <= target_num): keep = False
+                                                elif op == '>' and not (val > target_num): keep = False
+                                                elif op == '<' and not (val < target_num): keep = False
+                                                elif op in ('=', '==') and not (val == target_num): keep = False
+
+                            # Evaluate remaining simple WHERE checks on terminal node v
+                            if keep and clean_where.strip():
                                 for prop in ["year", "citations", "h_index", "venue", "field", "topic"]:
-                                    if prop in where_clause:
-                                        c_m = re.search(rf'{prop}\s*(=|>=|<=|>|<|!=|<>)\s*([^\s]+)', where_clause)
+                                    if prop in clean_where:
+                                        c_m = re.search(rf'{prop}\s*(=|>=|<=|>|<|!=|<>)\s*([^\s,)]+)', clean_where)
                                         if c_m:
                                             op, val_s = c_m.groups()
                                             val_s = val_s.strip().strip("'\"")
@@ -607,27 +679,53 @@ def execute_custom_cypher_pattern(G: nx.DiGraph, query_text: str):
                                             if val is not None:
                                                 try:
                                                     if isinstance(val, (int, float)):
-                                                        if op == '>=' and not (val >= float(val_s)): keep = False
-                                                        elif op == '<=' and not (val <= float(val_s)): keep = False
-                                                        elif op == '>' and not (val > float(val_s)): keep = False
-                                                        elif op == '<' and not (val < float(val_s)): keep = False
-                                                        elif op in ('=', '==') and not (val == float(val_s)): keep = False
+                                                        target_num = float(val_s)
+                                                        if op == '>=' and not (val >= target_num): keep = False
+                                                        elif op == '<=' and not (val <= target_num): keep = False
+                                                        elif op == '>' and not (val > target_num): keep = False
+                                                        elif op == '<' and not (val < target_num): keep = False
+                                                        elif op in ('=', '==') and not (val == target_num): keep = False
                                                     else:
                                                         if op in ('=', '==') and not (str(val).lower() == val_s.lower()): keep = False
                                                 except Exception:
                                                     pass
+
                             if keep:
                                 for n in curr_path:
                                     matched_nodes.add(n)
                                 for i in range(len(curr_path)-1):
                                     matched_edges.add((curr_path[i], curr_path[i+1]))
-                                path_names = [G.nodes[n].get("title") or G.nodes[n].get("name") or n for n in curr_path]
-                                results.append({
-                                    "Origin Node": G.nodes[u].get("title") or G.nodes[u].get("name"),
-                                    "Terminal Node": G.nodes[v].get("title") or G.nodes[v].get("name"),
-                                    "Traversal Hops": hops,
-                                    "Pattern Path": " -> ".join(path_names)
-                                })
+
+                                u_data = G.nodes[u]
+                                if return_clause:
+                                    row = {}
+                                    items = [it.strip() for it in return_clause.split(',') if it.strip()]
+                                    for it in items:
+                                        m_as = re.match(r'(.+?)\s+AS\s+(\w+)', it, re.IGNORECASE)
+                                        expr, alias = (m_as.group(1).strip(), m_as.group(2).strip()) if m_as else (it, it)
+                                        expr_l = expr.lower()
+                                        if 'length(' in expr_l:
+                                            row[alias] = hops
+                                        elif src_var and expr_l.startswith(f"{src_var.lower()}."):
+                                            p_name = expr.split('.', 1)[-1]
+                                            row[alias] = u_data.get(p_name, 'N/A')
+                                        elif dst_var and expr_l.startswith(f"{dst_var.lower()}."):
+                                            p_name = expr.split('.', 1)[-1]
+                                            row[alias] = v_data.get(p_name, 'N/A')
+                                        elif '.' in expr:
+                                            p_name = expr.split('.', 1)[-1]
+                                            row[alias] = v_data.get(p_name, u_data.get(p_name, 'N/A'))
+                                        else:
+                                            row[alias] = v_data.get('title') or v_data.get('name') or v
+                                    results.append(row)
+                                else:
+                                    path_names = [G.nodes[n].get("title") or G.nodes[n].get("name") or n for n in curr_path]
+                                    results.append({
+                                        "Origin Node": u_data.get("title") or u_data.get("name"),
+                                        "Terminal Node": v_data.get("title") or v_data.get("name"),
+                                        "Traversal Hops": hops,
+                                        "Pattern Path": " -> ".join(path_names)
+                                    })
 
                     if hops < max_hops:
                         nbrs = list(G.successors(curr)) if directed else list(G.neighbors(curr))
@@ -637,9 +735,20 @@ def execute_custom_cypher_pattern(G: nx.DiGraph, query_text: str):
                                 if nbr not in curr_path:
                                     queue.append((nbr, curr_path + [nbr]))
 
-    exec_latency_ms = round((time.perf_counter() - t_start) * 1000, 2)
-    df_res = pd.DataFrame(results)
+        df_res = pd.DataFrame(results)
+        if not df_res.empty and order_clause:
+            for ot in order_clause.split(','):
+                parts = ot.strip().split()
+                if parts:
+                    col = parts[0]
+                    asc = True if len(parts) < 2 or parts[1].upper() == 'ASC' else False
+                    match_cols = [c for c in df_res.columns if c.lower() == col.lower()]
+                    if match_cols:
+                        df_res = df_res.sort_values(by=match_cols[0], ascending=asc)
+        if limit_s and not df_res.empty:
+            df_res = df_res.head(int(limit_s))
 
+    exec_latency_ms = round((time.perf_counter() - t_start) * 1000, 2)
     total_graph_nodes = G.number_of_nodes()
     selectivity_pct = round((len(matched_nodes) / max(1, total_graph_nodes)) * 100, 1)
 
@@ -693,56 +802,7 @@ def build_network_plotly_figure(G: nx.DiGraph, pos: dict, matched_nodes: set, ma
             name='Matched Cypher Path'
         ))
 
-    # 3. Author nodes
-    auth_x, auth_y, auth_hover, auth_text = [], [], [], []
-    for node, d in G.nodes(data=True):
-        if d.get("label") == "Author":
-            x, y = pos[node]
-            auth_x.append(x)
-            auth_y.append(y)
-            auth_text.append(d.get("name", "").split()[-1])
-            auth_hover.append(
-                f"<b>Author:</b> {d.get('name')}<br>"
-                f"<b>Field:</b> {d.get('field')}<br>"
-                f"<b>Institution:</b> {d.get('institution')}<br>"
-                f"<b>h-index:</b> {d.get('h_index')}"
-            )
-
-    fig.add_trace(go.Scatter(
-        x=auth_x, y=auth_y,
-        mode='markers+text',
-        marker=dict(size=18, color='#2563eb', line=dict(width=1.5, color='#1e3a8a')),
-        text=auth_text,
-        textposition="top center",
-        hoverinfo='text',
-        hovertext=auth_hover,
-        name='Authors'
-    ))
-
-    # 4. Paper nodes
-    paper_x, paper_y, paper_hover = [], [], []
-    for node, d in G.nodes(data=True):
-        if d.get("label") == "Paper":
-            x, y = pos[node]
-            paper_x.append(x)
-            paper_y.append(y)
-            paper_hover.append(
-                f"<b>Paper:</b> {d.get('title')}<br>"
-                f"<b>Year:</b> {d.get('year')} | <b>Venue:</b> {d.get('venue')}<br>"
-                f"<b>Topic:</b> {d.get('topic')}<br>"
-                f"<b>Citations:</b> {d.get('citations')}"
-            )
-
-    fig.add_trace(go.Scatter(
-        x=paper_x, y=paper_y,
-        mode='markers',
-        marker=dict(symbol='square', size=13, color='#0d9488', line=dict(width=1.5, color='#115e59')),
-        hoverinfo='text',
-        hovertext=paper_hover,
-        name='Papers'
-    ))
-
-    # 5. Highlighted Nodes Halo
+    # 3. Highlighted Nodes Halo (rendered behind nodes so node IDs remain crisp)
     hl_x, hl_y, hl_hover = [], [], []
     for node in matched_nodes:
         if node in pos:
@@ -751,17 +811,84 @@ def build_network_plotly_figure(G: nx.DiGraph, pos: dict, matched_nodes: set, ma
             hl_x.append(x)
             hl_y.append(y)
             label = d.get("name") or d.get("title")
-            hl_hover.append(f"<b>[MATCHED]</b> {label} ({d.get('label')})")
+            hl_hover.append(f"<b>[MATCHED {node}]</b> {label} ({d.get('label')})")
 
     if hl_x:
         fig.add_trace(go.Scatter(
             x=hl_x, y=hl_y,
             mode='markers',
-            marker=dict(size=24, color='rgba(245, 158, 11, 0.45)', line=dict(width=2.5, color='#d97706')),
+            marker=dict(size=34, color='rgba(245, 158, 11, 0.45)', line=dict(width=2.5, color='#d97706')),
             hoverinfo='text',
             hovertext=hl_hover,
             name='Matched Subgraph Nodes'
         ))
+
+    # 4. Author nodes (circles with author ID inside e.g. A1, surname on top)
+    auth_x, auth_y, auth_hover, auth_id, auth_name = [], [], [], [], []
+    for node, d in G.nodes(data=True):
+        if d.get("label") == "Author":
+            x, y = pos[node]
+            auth_x.append(x)
+            auth_y.append(y)
+            auth_id.append(d.get("id", ""))
+            auth_name.append(d.get("name", "").split()[-1])
+            auth_hover.append(
+                f"<b>Author [{d.get('id')}]:</b> {d.get('name')}<br>"
+                f"<b>Field:</b> {d.get('field')}<br>"
+                f"<b>Institution:</b> {d.get('institution')}<br>"
+                f"<b>h-index:</b> {d.get('h_index')}"
+            )
+
+    fig.add_trace(go.Scatter(
+        x=auth_x, y=auth_y,
+        mode='markers+text',
+        marker=dict(size=22, color='#2563eb', line=dict(width=1.5, color='#1e3a8a')),
+        text=auth_id,
+        textposition="middle center",
+        textfont=dict(color='white', size=9, family='Arial, sans-serif'),
+        hoverinfo='text',
+        hovertext=auth_hover,
+        name='Authors',
+        legendgroup='Authors'
+    ))
+
+    fig.add_trace(go.Scatter(
+        x=auth_x, y=[y + 0.045 for y in auth_y],
+        mode='text',
+        text=auth_name,
+        textposition="top center",
+        textfont=dict(color='#1e293b', size=11),
+        hoverinfo='none',
+        showlegend=False,
+        legendgroup='Authors'
+    ))
+
+    # 5. Paper nodes (square with number written inside, e.g., 16 for P16)
+    paper_x, paper_y, paper_hover, paper_num = [], [], [], []
+    for node, d in G.nodes(data=True):
+        if d.get("label") == "Paper":
+            x, y = pos[node]
+            paper_x.append(x)
+            paper_y.append(y)
+            paper_num.append(d.get("id", "").replace("P", ""))
+            paper_hover.append(
+                f"<b>Paper [{d.get('id')}]:</b> {d.get('title')}<br>"
+                f"<b>Year:</b> {d.get('year')} | <b>Venue:</b> {d.get('venue')}<br>"
+                f"<b>Topic:</b> {d.get('topic')}<br>"
+                f"<b>Citations:</b> {d.get('citations')}"
+            )
+
+    fig.add_trace(go.Scatter(
+        x=paper_x, y=paper_y,
+        mode='markers+text',
+        marker=dict(symbol='square', size=22, color='#0d9488', line=dict(width=1.5, color='#115e59')),
+        text=paper_num,
+        textposition="middle center",
+        textfont=dict(color='white', size=10, family='Arial, sans-serif'),
+        hoverinfo='text',
+        hovertext=paper_hover,
+        name='Papers'
+    ))
 
     fig.update_layout(
         title=title,
